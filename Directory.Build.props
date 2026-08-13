@@ -1,0 +1,10 @@
+<Project>
+
+  <!-- 仓库级版本号单一来源：发布时仅需在此更新。 -->
+  <PropertyGroup>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+  </PropertyGroup>
+
+</Project>

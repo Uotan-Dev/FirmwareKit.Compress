@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="FirmwareKit.Compress/FirmwareKit.Compress.csproj" />
+  <Project Path="FirmwareKit.Compress.Cli/FirmwareKit.Compress.Cli.csproj" />
+  <Project Path="FirmwareKit.Compress.Tests/FirmwareKit.Compress.Tests.csproj" />
+</Solution>
