@@ -3,6 +3,18 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增 / Added
+
+- 编码端多核并行压缩：`CompressionOptions.MaxDegreeOfParallelism`（null/1=串行，默认）。
+  - 自研 XZ (LZMA2) 编码器按固定 2 MiB 窗口并行，输出与串行逐字节一致；
+  - Zopfli 按切分块并行（`ZopfliOptions.MaxDegreeOfParallelism`），输出与串行逐字节一致；
+  - gzip/zlib/deflate/bzip2/zstd 按 1 MiB 块生成独立成员/帧后拼接为确定性多成员流；
+  - brotli（.NET 解码器不支持串联流）与 lz4（K4os 解码器对 ≥512 KB 串联帧不可靠）暂不并行。
+- 解码端支持多成员流（仍单线程）：bzip2 改用 `decompressConcatenated=true`；
+  zlib/deflate 改用 SharpCompress 解码器并按 `TotalIn` 逐成员解压。
+
 ## [1.0.0] - 2026-08-13
 
 ### 新增 / Added

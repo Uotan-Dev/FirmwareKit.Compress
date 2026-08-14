@@ -29,6 +29,11 @@ public static class Lz4Compressor
 
         try
         {
+            // 注：LZ4 不做分块并行。K4os LZ4Stream 解码器对 ≥512 KB 的串联帧不可靠
+            // （只解首个帧），故保持单帧串行输出（与既有实现逐字节一致）。
+            // Note: LZ4 is not chunked in parallel. The K4os LZ4Stream decoder does not
+            // reliably decode concatenated frames ≥512 KB (only the first frame is read),
+            // so single-frame sequential output is kept (byte-identical to before).
             using var output = new MemoryStream();
             using (var encoder = LZ4Stream.Encode(output, ToLz4Level(options?.Level), leaveOpen: true))
             {

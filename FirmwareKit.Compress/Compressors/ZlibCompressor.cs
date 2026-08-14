@@ -24,6 +24,12 @@ public static class ZlibCompressor
 
         try
         {
+            // 并行分块：每块压缩为独立 zlib 流后按序拼接（多成员 zlib，由本库 TotalIn 循环解压）。
+            byte[]? parallel = ParallelCompression.TryCompressChunks(data, options?.MaxDegreeOfParallelism,
+                (start, count) => CompressChunk(data, start, count, options));
+            if (parallel != null)
+                return parallel;
+
             using var output = new MemoryStream();
             using (var zlib = new ZlibStream(new NonDisposingStream(output), CompressionMode.Compress, CompressionLevelMapper.ToSharpCompressDeflate(options?.Level)))
             {
@@ -35,6 +41,20 @@ public static class ZlibCompressor
         {
             throw new CompressionException("ZLIB 压缩失败", ex);
         }
+    }
+
+    /// <summary>
+    /// 把 [start, start+count) 压缩为独立的 zlib 流（并行分块用）。
+    /// <para>Compresses [start, start+count) into an independent zlib stream (for parallel chunking).</para>
+    /// </summary>
+    private static byte[] CompressChunk(byte[] data, int start, int count, CompressionOptions? options)
+    {
+        using var output = new MemoryStream();
+        using (var zlib = new ZlibStream(new NonDisposingStream(output), CompressionMode.Compress, CompressionLevelMapper.ToSharpCompressDeflate(options?.Level)))
+        {
+            zlib.Write(data, start, count);
+        }
+        return output.ToArray();
     }
 
     /// <summary>
@@ -50,11 +70,29 @@ public static class ZlibCompressor
 
         try
         {
-            using var input = new MemoryStream(data);
-            using var zlib = new ZlibStream(input, CompressionMode.Decompress);
             using var output = new MemoryStream();
-            zlib.CopyTo(output);
+            int offset = 0;
+
+            // 逐成员解压：并行模式产出多成员 zlib 流，用解码器 TotalIn 精确定位成员边界。
+            // Decompress member by member: parallel mode produces multi-member zlib streams;
+            // the decoder's TotalIn locates each member boundary exactly.
+            while (offset < data.Length)
+            {
+                using var sub = new MemoryStream(data, offset, data.Length - offset, writable: false);
+                using var zlib = new ZlibStream(sub, CompressionMode.Decompress);
+                zlib.CopyTo(output);
+
+                long consumed = zlib.TotalIn;
+                if (consumed <= 0)
+                    throw new CompressionException("ZLIB 数据格式无效：无法定位成员边界");
+                offset += (int)consumed;
+            }
+
             return output.ToArray();
+        }
+        catch (CompressionException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -97,8 +135,32 @@ public static class ZlibCompressor
 
         try
         {
-            using var zlib = new ZlibStream(new NonDisposingStream(input), CompressionMode.Decompress);
-            zlib.CopyTo(output);
+            if (input.CanSeek)
+            {
+                // 可定位流：逐成员解压，用 TotalIn 精确推进到下一成员起点。
+                // Seekable input: decompress member by member, advancing by TotalIn.
+                while (true)
+                {
+                    long memberStart = input.Position;
+                    using var zlib = new ZlibStream(new NonDisposingStream(input), CompressionMode.Decompress);
+                    zlib.CopyTo(output);
+
+                    long consumed = zlib.TotalIn;
+                    if (consumed <= 0)
+                        break;
+                    long next = memberStart + consumed;
+                    if (next >= input.Length)
+                        break;
+                    input.Position = next;
+                }
+            }
+            else
+            {
+                // 不可定位流：无法确定成员边界，按单成员处理（与既有行为一致）。
+                // Non-seekable input: member boundaries cannot be located; treat as single member.
+                using var zlib = new ZlibStream(new NonDisposingStream(input), CompressionMode.Decompress);
+                zlib.CopyTo(output);
+            }
         }
         catch (Exception ex)
         {

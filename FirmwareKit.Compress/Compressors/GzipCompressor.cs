@@ -23,6 +23,12 @@ public static class GzipCompressor
 
         try
         {
+            // 并行分块：每块压缩为独立 gzip 成员后按序拼接（多成员 gzip，.NET GZipStream 原生可解）。
+            byte[]? parallel = ParallelCompression.TryCompressChunks(data, options?.MaxDegreeOfParallelism,
+                (start, count) => CompressChunk(data, start, count, options));
+            if (parallel != null)
+                return parallel;
+
             using var output = new MemoryStream();
             using (var gzip = new GZipStream(output, Polyfill.MapCompressionLevel(options?.Level), leaveOpen: true))
             {
@@ -34,6 +40,20 @@ public static class GzipCompressor
         {
             throw new CompressionException("GZIP 压缩失败", ex);
         }
+    }
+
+    /// <summary>
+    /// 把 [start, start+count) 压缩为独立的 gzip 成员（并行分块用）。
+    /// <para>Compresses [start, start+count) into an independent gzip member (for parallel chunking).</para>
+    /// </summary>
+    private static byte[] CompressChunk(byte[] data, int start, int count, CompressionOptions? options)
+    {
+        using var output = new MemoryStream();
+        using (var gzip = new GZipStream(output, Polyfill.MapCompressionLevel(options?.Level), leaveOpen: true))
+        {
+            gzip.Write(data, start, count);
+        }
+        return output.ToArray();
     }
 
     /// <summary>

@@ -290,14 +290,42 @@ public static class CompressionService
             CompressionFormat.Lz4Legacy => Lz4Compressor.CompressLegacy(data, options),
             CompressionFormat.Lz4Lg => Lz4Compressor.CompressLg(data, options),
             CompressionFormat.Lzma => LzmaCompressor.Compress(data, options),
-            CompressionFormat.Xz => XzCompressor.Compress(data, options?.DictionarySize ?? Lzma2Encoder.DefaultDictionarySize),
+            CompressionFormat.Xz => XzCompressor.Compress(data, options?.DictionarySize ?? Lzma2Encoder.DefaultDictionarySize, maxDegreeOfParallelism: options?.MaxDegreeOfParallelism),
             CompressionFormat.Bzip2 => Bzip2Compressor.Compress(data, options),
-            CompressionFormat.Zopfli => ZopfliCompressor.Compress(data, options?.Zopfli),
+            CompressionFormat.Zopfli => ZopfliCompressor.Compress(data, EffectiveZopfliOptions(options)),
             CompressionFormat.Lzop => LzopCompressor.Compress(data, options),
             CompressionFormat.Zstd => ZstdCompressor.Compress(data, options),
             CompressionFormat.None => data,
             _ => throw new ArgumentException($"Unsupported compression format: {format}", nameof(format))
         };
+    }
+
+    /// <summary>
+    /// 合成 Zopfli 选项：外层 <see cref="CompressionOptions.MaxDegreeOfParallelism"/>
+    /// 仅在 <see cref="ZopfliOptions.MaxDegreeOfParallelism"/> 未设置时作为回退。
+    /// <para>Composes the Zopfli options: the outer <see cref="CompressionOptions.MaxDegreeOfParallelism"/>
+    /// is used as a fallback only when <see cref="ZopfliOptions.MaxDegreeOfParallelism"/> is not set.</para>
+    /// </summary>
+    private static ZopfliOptions? EffectiveZopfliOptions(CompressionOptions? options)
+    {
+        var zopfli = options?.Zopfli;
+        int? outer = options?.MaxDegreeOfParallelism;
+
+        if (zopfli == null)
+            return outer.HasValue ? new ZopfliOptions { MaxDegreeOfParallelism = outer } : null;
+
+        if (!zopfli.MaxDegreeOfParallelism.HasValue && outer.HasValue)
+        {
+            return new ZopfliOptions
+            {
+                NumIterations = zopfli.NumIterations,
+                BlockSplitting = zopfli.BlockSplitting,
+                BlockSplittingMax = zopfli.BlockSplittingMax,
+                MaxDegreeOfParallelism = outer,
+            };
+        }
+
+        return zopfli;
     }
 
     private static byte[] DecompressCore(byte[] data, CompressionFormat format)

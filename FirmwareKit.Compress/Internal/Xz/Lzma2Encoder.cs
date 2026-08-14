@@ -40,34 +40,86 @@ internal static class Lzma2Encoder
     /// <summary>
     /// 将输入编码为 LZMA2 原始流（不含 XZ 容器）。
     /// <para>Encodes the input into a raw LZMA2 stream (without the XZ container).</para>
+    /// <para>
+    /// 输入按固定 2 MiB 窗口切分，每个窗口用独立 LZMA1 编码器压缩（全量重置，互不依赖），
+    /// 因此窗口可并行压缩；输出按窗口顺序拼接，与串行结果逐字节一致（确定性）。
+    /// 无法压缩的窗口整体按 ≤64 KiB 的未压缩块输出。
+    /// </para>
+    /// <para>
+    /// The input is split into fixed 2 MiB windows; each window is compressed by an
+    /// independent LZMA1 encoder (full reset, no cross-window dependency), so windows
+    /// can be compressed in parallel; output is assembled in window order and is
+    /// byte-identical to sequential execution (deterministic). Incompressible windows
+    /// are emitted as ≤64 KiB uncompressed chunks.
+    /// </para>
     /// </summary>
-    public static byte[] Encode(byte[] data, uint dictionarySize = DefaultDictionarySize)
+    public static byte[] Encode(byte[] data, uint dictionarySize = DefaultDictionarySize, int? maxDegreeOfParallelism = null)
     {
+        // 固定 2 MiB 窗口起点：与压缩结果无关，天然可分块并行。
+        // Fixed 2 MiB window starts: independent of compression outcomes → parallelizable.
+        var windowStarts = new List<int>();
+        for (int pos = 0; pos < data.Length; pos += UncompressedChunkMax)
+            windowStarts.Add(pos);
+
+        int windowCount = windowStarts.Count;
+        var compressed = new byte[windowCount][];
+        int dop = Parallelism.Resolve(maxDegreeOfParallelism, windowCount);
+
+        if (dop > 1)
+        {
+            // 每个窗口独立压缩：独立 LZMA1 编码器 + 全量重置，线程安全。
+            // Each window compresses independently: own LZMA1 encoder + full reset, thread-safe.
+            System.Threading.Tasks.Parallel.For(
+                0, windowCount,
+                new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = dop },
+                i =>
+                {
+                    int start = windowStarts[i];
+                    int chunkSize = Math.Min(UncompressedChunkMax, data.Length - start);
+                    compressed[i] = Lzma1Compress(data, start, chunkSize, dictionarySize);
+                });
+        }
+        else
+        {
+            for (int i = 0; i < windowCount; i++)
+            {
+                int start = windowStarts[i];
+                int chunkSize = Math.Min(UncompressedChunkMax, data.Length - start);
+                compressed[i] = Lzma1Compress(data, start, chunkSize, dictionarySize);
+            }
+        }
+
         using var output = new MemoryStream();
-        int pos = 0;
         bool firstChunk = true;
 
-        while (pos < data.Length)
+        // 按窗口顺序拼接输出（与串行一致）。
+        // Assemble output in window order (identical to sequential).
+        for (int i = 0; i < windowCount; i++)
         {
-            int chunkSize = Math.Min(UncompressedChunkMax, data.Length - pos);
-            byte[] compressed = Lzma1Compress(data, pos, chunkSize, dictionarySize);
+            int start = windowStarts[i];
+            int chunkSize = Math.Min(UncompressedChunkMax, data.Length - start);
+            byte[] result = compressed[i];
 
             // 压缩有效（更小且压缩大小可放入 16 位字段）时输出 LZMA 块，否则按未压缩块输出。
-            if (compressed.Length < chunkSize && compressed.Length <= 0xFFFF)
+            if (result.Length < chunkSize && result.Length <= 0xFFFF)
             {
-                WriteLzmaChunkHeader(output, chunkSize, compressed.Length);
-                output.Write(compressed, 0, compressed.Length);
+                WriteLzmaChunkHeader(output, chunkSize, result.Length);
+                output.Write(result, 0, result.Length);
                 firstChunk = false;
-                pos += chunkSize;
             }
             else
             {
                 // 未压缩块最多 64 KiB，超出的拆成多个未压缩块。
-                int sub = Math.Min(0x10000, data.Length - pos);
-                WriteUncompressedChunkHeader(output, firstChunk, sub);
-                output.Write(data, pos, sub);
-                firstChunk = false;
-                pos += sub;
+                int subStart = start;
+                int subEnd = start + chunkSize;
+                while (subStart < subEnd)
+                {
+                    int sub = Math.Min(0x10000, subEnd - subStart);
+                    WriteUncompressedChunkHeader(output, firstChunk, sub);
+                    output.Write(data, subStart, sub);
+                    firstChunk = false;
+                    subStart += sub;
+                }
             }
         }
 

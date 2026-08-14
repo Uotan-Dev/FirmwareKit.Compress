@@ -1,3 +1,4 @@
+using FirmwareKit.Compress.Internal;
 using ZstdSharp;
 
 namespace FirmwareKit.Compress.Compressors;
@@ -23,6 +24,12 @@ public static class ZstdCompressor
 
         try
         {
+            // 并行分块：每块压缩为独立 zstd 帧后按序拼接（多帧 zstd，ZstdSharp 解码器原生支持）。
+            byte[]? parallel = ParallelCompression.TryCompressChunks(data, options?.MaxDegreeOfParallelism,
+                (start, count) => CompressChunk(data, start, count, options));
+            if (parallel != null)
+                return parallel;
+
             using var compressor = new Compressor(options?.Level ?? 3);
             return compressor.Wrap(data).ToArray();
         }
@@ -30,6 +37,16 @@ public static class ZstdCompressor
         {
             throw new CompressionException("ZSTD 压缩失败", ex);
         }
+    }
+
+    /// <summary>
+    /// 把 [start, start+count) 压缩为独立的 zstd 帧（并行分块用）。
+    /// <para>Compresses [start, start+count) into an independent zstd frame (for parallel chunking).</para>
+    /// </summary>
+    private static byte[] CompressChunk(byte[] data, int start, int count, CompressionOptions? options)
+    {
+        using var compressor = new Compressor(options?.Level ?? 3);
+        return compressor.Wrap(data.AsSpan(start, count)).ToArray();
     }
 
     /// <summary>

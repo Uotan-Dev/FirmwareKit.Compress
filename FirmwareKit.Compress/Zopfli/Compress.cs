@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 
 namespace FirmwareKit.Compress.Internal.Zopfli
 {
@@ -2094,19 +2095,54 @@ namespace FirmwareKit.Compress.Internal.Zopfli
             {
                 ZopfliBlockSplit(InFile, instart, inend, splitpoints_uncompressed);
                 npoints = (ulong)splitpoints_uncompressed.Count;
+                int blockCount = (int)npoints + 1;
+                int numiterations = Globals.numiterations;
 
-                for (i = 0; i <= (int)npoints; i++)
+                // 每个切分块的 LZ77 最优计算相互独立（各自的状态/哈希/固定种子随机数），
+                // 可并行执行；结果按块序拼接，与串行逐字节一致（确定性）。
+                // Each split block's optimal LZ77 is independent (own state/hash/fixed-seed RNG),
+                // so blocks can be compressed in parallel; results are appended in block order,
+                // byte-identical to sequential execution (deterministic).
+                int dop = Parallelism.Resolve(Globals.maxdop, blockCount);
+                if (dop > 1)
                 {
-                    int start = i == 0 ? instart : (int)splitpoints_uncompressed[i - 1];
-                    int end = i == (int)npoints ? inend : (int)splitpoints_uncompressed[i];
-                    ZopfliBlockState s = new ZopfliBlockState(start, end, 1);
-                    ZopfliLZ77Store store = new ZopfliLZ77Store(InFile);
-                    ZopfliLZ77Optimal(s, InFile, start, end, Globals.numiterations, store);
-                    totalcost += ZopfliCalculateBlockSizeAutoType(store, 0, store.size);
+                    var stores = new ZopfliLZ77Store[blockCount];
+                    var costs = new double[blockCount];
+                    Parallel.For(0, blockCount, new ParallelOptions { MaxDegreeOfParallelism = dop },
+                        bi =>
+                        {
+                            int start = bi == 0 ? instart : (int)splitpoints_uncompressed[bi - 1];
+                            int end = bi == blockCount - 1 ? inend : (int)splitpoints_uncompressed[bi];
+                            ZopfliBlockState s = new ZopfliBlockState(start, end, 1);
+                            ZopfliLZ77Store store = new ZopfliLZ77Store(InFile);
+                            ZopfliLZ77Optimal(s, InFile, start, end, numiterations, store);
+                            stores[bi] = store;
+                            costs[bi] = ZopfliCalculateBlockSizeAutoType(store, 0, store.size);
+                        });
 
-                    ZopfliAppendLZ77Store(store, lz77);
-                    if (i < (int)npoints) splitpoints.Add(lz77.size);
+                    // 串行按块序拼接，保证输出与串行逐字节一致。
+                    // Append in block order sequentially so output is byte-identical to sequential.
+                    for (i = 0; i < blockCount; i++)
+                    {
+                        totalcost += costs[i];
+                        ZopfliAppendLZ77Store(stores[i], lz77);
+                        if (i < (int)npoints) splitpoints.Add(lz77.size);
+                    }
+                }
+                else
+                {
+                    for (i = 0; i <= (int)npoints; i++)
+                    {
+                        int start = i == 0 ? instart : (int)splitpoints_uncompressed[i - 1];
+                        int end = i == (int)npoints ? inend : (int)splitpoints_uncompressed[i];
+                        ZopfliBlockState s = new ZopfliBlockState(start, end, 1);
+                        ZopfliLZ77Store store = new ZopfliLZ77Store(InFile);
+                        ZopfliLZ77Optimal(s, InFile, start, end, numiterations, store);
+                        totalcost += ZopfliCalculateBlockSizeAutoType(store, 0, store.size);
 
+                        ZopfliAppendLZ77Store(store, lz77);
+                        if (i < (int)npoints) splitpoints.Add(lz77.size);
+                    }
                 }
             }
             else

@@ -31,8 +31,9 @@ public static class XzCompressor
     /// <param name="data">待压缩数据。<para>Data to compress.</para></param>
     /// <param name="dictionarySize">字典大小（默认 8 MiB）。<para>Dictionary size (default 8 MiB).</para></param>
     /// <param name="checkType">校验类型（0x01=CRC32，0x04=CRC64）。<para>Check type (0x01=CRC32, 0x04=CRC64).</para></param>
+    /// <param name="maxDegreeOfParallelism">多核并行度；null/1 为串行。输出与串行逐字节一致。<para>Multi-core parallelism; null/1 = sequential. Output is byte-identical to sequential.</para></param>
     /// <returns>完整的 .xz 数据。<para>Complete .xz data.</para></returns>
-    public static byte[] Compress(byte[] data, uint dictionarySize = Lzma2Encoder.DefaultDictionarySize, byte checkType = XzContainer.CheckTypeCrc32)
+    public static byte[] Compress(byte[] data, uint dictionarySize = Lzma2Encoder.DefaultDictionarySize, byte checkType = XzContainer.CheckTypeCrc32, int? maxDegreeOfParallelism = null)
     {
         try
         {
@@ -41,7 +42,7 @@ public static class XzCompressor
                 return XzContainer.Wrap(Lzma2EosMarker, data, dictionarySize, checkType);
             }
 
-            byte[] lzma2 = Lzma2Encoder.Encode(data, dictionarySize);
+            byte[] lzma2 = Lzma2Encoder.Encode(data, dictionarySize, maxDegreeOfParallelism);
             return XzContainer.Wrap(lzma2, data, dictionarySize, checkType);
         }
         catch (Exception ex)

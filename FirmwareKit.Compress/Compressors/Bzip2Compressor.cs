@@ -1,3 +1,4 @@
+using FirmwareKit.Compress.Internal;
 using SharpCompress.Compressors;
 using SharpCompress.Compressors.BZip2;
 
@@ -23,6 +24,12 @@ public static class Bzip2Compressor
 
         try
         {
+            // 并行分块：每块压缩为独立 bzip2 流后按序拼接（多成员 bzip2，解压端需 decompressConcatenated=true）。
+            byte[]? parallel = ParallelCompression.TryCompressChunks(data, options?.MaxDegreeOfParallelism,
+                (start, count) => CompressChunk(data, start, count, options));
+            if (parallel != null)
+                return parallel;
+
             using var output = new MemoryStream();
             using (var bzip2 = BZip2Stream.Create(output, CompressionMode.Compress, decompressConcatenated: false, leaveOpen: false))
             {
@@ -35,6 +42,21 @@ public static class Bzip2Compressor
         {
             throw new CompressionException("BZIP2 压缩失败", ex);
         }
+    }
+
+    /// <summary>
+    /// 把 [start, start+count) 压缩为独立的 bzip2 流（并行分块用）。
+    /// <para>Compresses [start, start+count) into an independent bzip2 stream (for parallel chunking).</para>
+    /// </summary>
+    private static byte[] CompressChunk(byte[] data, int start, int count, CompressionOptions? options)
+    {
+        using var output = new MemoryStream();
+        using (var bzip2 = BZip2Stream.Create(output, CompressionMode.Compress, decompressConcatenated: false, leaveOpen: false))
+        {
+            bzip2.Write(data, start, count);
+            bzip2.Finish();
+        }
+        return output.ToArray();
     }
 
     /// <summary>
@@ -51,7 +73,7 @@ public static class Bzip2Compressor
         try
         {
             using var input = new MemoryStream(data);
-            using var bzip2 = BZip2Stream.Create(input, CompressionMode.Decompress, decompressConcatenated: false, leaveOpen: false);
+            using var bzip2 = BZip2Stream.Create(input, CompressionMode.Decompress, decompressConcatenated: true, leaveOpen: false);
             using var output = new MemoryStream();
             bzip2.CopyTo(output);
             return output.ToArray();
@@ -103,7 +125,9 @@ public static class Bzip2Compressor
 
         try
         {
-            using var bzip2 = BZip2Stream.Create(input, CompressionMode.Decompress, decompressConcatenated: false, leaveOpen: true);
+            // decompressConcatenated=true：支持并行模式产出的多成员（串联）bzip2 流，
+            // 对单成员输入行为不变。
+            using var bzip2 = BZip2Stream.Create(input, CompressionMode.Decompress, decompressConcatenated: true, leaveOpen: true);
             bzip2.CopyTo(output);
         }
         catch (Exception ex)

@@ -26,6 +26,13 @@ public sealed class ZopfliOptions
     /// <para>Maximum number of split blocks (default 15, 0 means unlimited).</para>
     /// </summary>
     public int BlockSplittingMax { get; set; } = 15;
+
+    /// <summary>
+    /// 多核并行度：null/1 为串行；&gt;1 时按切分块并行压缩（输出与串行逐字节一致）。
+    /// <para>Multi-core parallelism: null/1 = sequential; &gt;1 compresses split blocks in
+    /// parallel (output is byte-identical to sequential).</para>
+    /// </summary>
+    public int? MaxDegreeOfParallelism { get; set; }
 }
 
 /// <summary>
@@ -82,6 +89,7 @@ public static class ZopfliCompressor
             Globals.blocksplittingmax = Math.Max(0, options.BlockSplittingMax);
             Globals.verbose = 0;
             Globals.verbose_more = 0;
+            Globals.maxdop = options.MaxDegreeOfParallelism;
 
             using var input = new MemoryStream(data);
             using var output = new MemoryStream();

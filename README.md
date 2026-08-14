@@ -79,11 +79,19 @@ var options = new CompressionOptions { Level = 9 };
 // XZ/LZMA 字典大小（字节）
 options.DictionarySize = 1u << 22;
 
+// 编码端多核并行（仅编码；解码始终单线程但能解回多成员流）：
+// - xz/lzma2、zopfli：输出与串行逐字节一致（确定性）
+// - gzip/zlib/deflate/bzip2/zstd：按 1 MiB 块生成独立成员/帧后拼接，
+//   输出为确定性多成员流（格式合法、标准解压器可解），但与单成员串行输出字节不同
+// - brotli（.NET 解码器不支持串联流）与 lz4（K4os 解码器对 ≥512 KB 串联帧不可靠）暂不并行
+options.MaxDegreeOfParallelism = 4;
+
 // Zopfli 专用选项
 options.Zopfli = new FirmwareKit.Compress.Compressors.ZopfliOptions
 {
     NumIterations = 30,        // 迭代次数越多压缩率越高、越慢（默认 15）
     BlockSplitting = true,     // 启用块切分（默认 true）
+    MaxDegreeOfParallelism = 4, // Zopfli 按切分块并行（可选，外层选项亦可）
 };
 ```
 

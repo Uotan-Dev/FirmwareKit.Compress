@@ -22,6 +22,7 @@ internal static class Globals
     [ThreadStatic] private static ZopfliFormat? _outputType;
     [ThreadStatic] private static int? _verbose;
     [ThreadStatic] private static int? _verboseMore;
+    [ThreadStatic] private static int? _maxdop;
 
     /// <summary>是否输出基本诊断信息（默认 0=关闭）。<para>Whether to print basic diagnostics (default 0=off).</para></summary>
     public static int verbose
@@ -63,5 +64,12 @@ internal static class Globals
     {
         get => _outputType ?? ZopfliFormat.ZOPFLI_FORMAT_GZIP;
         set => _outputType = value;
+    }
+
+    /// <summary>多核并行度（null/1=串行，>1=按切分块并行）。<para>Multi-core parallelism (null/1 = sequential, &gt;1 = parallel per split block).</para></summary>
+    public static int? maxdop
+    {
+        get => _maxdop;
+        set => _maxdop = value;
     }
 }
