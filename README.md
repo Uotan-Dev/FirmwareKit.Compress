@@ -60,7 +60,8 @@ var format = CompressionFormats.Detect(gz);            // Gzip
 var parsed = CompressionFormats.Parse("xz");           // Xz
 var ext = CompressionFormats.ToExtension(format);      // ".gz"
 
-// Stream API：流式格式直接管道，块格式自动缓冲
+// Stream API：流式格式直接管道；块格式（xz/lzma/zstd/lz4_legacy/lz4_lg/lzop）边读边压，
+// 不再整块缓冲，大文件内存开销显著降低（zopfli 因全局优化仍需整块输入）。
 using (var input = File.OpenRead("payload.bin"))
 using (var output = File.Create("payload.xz"))
     CompressionService.Compress(input, output, CompressionFormat.Xz);

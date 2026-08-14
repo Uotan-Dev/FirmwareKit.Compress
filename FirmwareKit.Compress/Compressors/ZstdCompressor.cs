@@ -72,6 +72,59 @@ public static class ZstdCompressor
     }
 
     /// <summary>
+    /// 流式 Zstd 压缩：基于 ZstdSharp 的 <see cref="CompressionStream"/> 直接管道，
+    /// 无需整块缓冲，适合大输入。
+    /// <para>Streaming zstd compression: pipes through ZstdSharp's
+    /// <see cref="CompressionStream"/> without full buffering, suitable for large inputs.</para>
+    /// </summary>
+    /// <param name="input">待压缩的输入流。<para>The input stream to compress.</para></param>
+    /// <param name="output">写入 zstd 帧的输出流。<para>The output stream receiving the zstd frame.</para></param>
+    /// <param name="options">压缩选项（Level：-5..22，null=3）。<para>Compression options (Level: -5..22, null=3).</para></param>
+    public static void Compress(Stream input, Stream output, CompressionOptions? options = null)
+    {
+        if (input == null)
+            throw new ArgumentNullException(nameof(input));
+        if (output == null)
+            throw new ArgumentNullException(nameof(output));
+
+        try
+        {
+            using var compressor = new CompressionStream(new NonDisposingStream(output), options?.Level ?? 3);
+            input.CopyTo(compressor);
+        }
+        catch (Exception ex)
+        {
+            throw new CompressionException("ZSTD 压缩失败", ex);
+        }
+    }
+
+    /// <summary>
+    /// 流式 Zstd 解压：基于 ZstdSharp 的 <see cref="DecompressionStream"/> 直接管道，
+    /// 无需整块缓冲，适合大输入。
+    /// <para>Streaming zstd decompression: pipes through ZstdSharp's
+    /// <see cref="DecompressionStream"/> without full buffering, suitable for large inputs.</para>
+    /// </summary>
+    /// <param name="input">zstd 帧输入流。<para>The input stream containing zstd frames.</para></param>
+    /// <param name="output">写入解压结果的输出流。<para>The output stream receiving the decompressed data.</para></param>
+    public static void Decompress(Stream input, Stream output)
+    {
+        if (input == null)
+            throw new ArgumentNullException(nameof(input));
+        if (output == null)
+            throw new ArgumentNullException(nameof(output));
+
+        try
+        {
+            using var decompressor = new DecompressionStream(new NonDisposingStream(input));
+            decompressor.CopyTo(output);
+        }
+        catch (Exception ex)
+        {
+            throw new CompressionException("ZSTD 解压失败", ex);
+        }
+    }
+
+    /// <summary>
     /// 检测数据是否为 zstd 格式（魔数 28 B5 2F FD）。
     /// <para>Detects whether the data is in zstd format (magic 28 B5 2F FD).</para>
     /// </summary>

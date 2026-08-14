@@ -129,6 +129,120 @@ internal static class Lzma2Encoder
     }
 
     /// <summary>
+    /// 流式编码：从 <paramref name="input"/> 按固定 2 MiB 窗口读取并编码为 LZMA2 原始流，
+    /// 写入 <paramref name="output"/>。内存占用有界：每次仅缓冲至多
+    /// maxDegreeOfParallelism 个窗口（各 ≤2 MiB），不整块缓冲输入。
+    /// 输出与 <see cref="Encode(byte[], uint, int?)"/> 对相同输入逐字节一致。
+    /// <para>Streaming encode: reads <paramref name="input"/> in fixed 2 MiB windows and
+    /// encodes them into a raw LZMA2 stream written to <paramref name="output"/>.
+    /// Memory is bounded: only up to maxDegreeOfParallelism windows (each ≤2 MiB) are
+    /// buffered at a time; the input is never fully buffered. The output is byte-identical
+    /// to <see cref="Encode(byte[], uint, int?)"/> for the same input.</para>
+    /// </summary>
+    /// <param name="input">待压缩的输入流。<para>The input stream to compress.</para></param>
+    /// <param name="output">写入 LZMA2 原始流的输出流。<para>The output stream receiving the raw LZMA2 stream.</para></param>
+    /// <param name="dictionarySize">字典大小（默认 8 MiB）。<para>Dictionary size (default 8 MiB).</para></param>
+    /// <param name="maxDegreeOfParallelism">多核并行度；null/1 为串行。<para>Multi-core parallelism; null/1 = sequential.</para></param>
+    /// <param name="onOriginalWindow">每读入一个原始窗口后回调（用于增量校验和）；可为 null。
+    /// <para>Callback invoked after each original window is read (for incremental checksums); may be null.</para></param>
+    /// <returns>未压缩总字节数。<para>The total uncompressed byte count.</para></returns>
+    public static long Encode(Stream input, Stream output, uint dictionarySize = DefaultDictionarySize,
+        int? maxDegreeOfParallelism = null, Action<byte[], int, int>? onOriginalWindow = null)
+    {
+        int dop = Parallelism.Resolve(maxDegreeOfParallelism, 2);
+        var windows = new List<byte[]>(dop);
+        long total = 0;
+        bool firstChunk = true;
+
+        while (true)
+        {
+            // 批量读取至多 dop 个窗口（内存有界）。
+            // Read a batch of up to dop windows (bounded memory).
+            windows.Clear();
+            while (windows.Count < dop)
+            {
+                byte[]? win = ReadWindow(input);
+                if (win == null)
+                    break; // EOF
+                onOriginalWindow?.Invoke(win, 0, win.Length);
+                windows.Add(win);
+                total += win.Length;
+            }
+            if (windows.Count == 0)
+                break;
+
+            // 各窗口独立压缩（独立编码器 + 全量重置，线程安全）。
+            // Each window compresses independently (own encoder + full reset, thread-safe).
+            var compressed = new byte[windows.Count][];
+            if (windows.Count > 1 && dop > 1)
+            {
+                System.Threading.Tasks.Parallel.For(
+                    0, windows.Count,
+                    new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = dop },
+                    i => compressed[i] = Lzma1Compress(windows[i], 0, windows[i].Length, dictionarySize));
+            }
+            else
+            {
+                for (int i = 0; i < windows.Count; i++)
+                    compressed[i] = Lzma1Compress(windows[i], 0, windows[i].Length, dictionarySize);
+            }
+
+            // 按窗口顺序拼接输出（与串行一致）。
+            // Assemble output in window order (identical to sequential).
+            for (int i = 0; i < windows.Count; i++)
+            {
+                byte[] win = windows[i];
+                byte[] result = compressed[i];
+
+                if (result.Length < win.Length && result.Length <= 0xFFFF)
+                {
+                    WriteLzmaChunkHeader(output, win.Length, result.Length);
+                    output.Write(result, 0, result.Length);
+                    firstChunk = false;
+                }
+                else
+                {
+                    int subStart = 0;
+                    while (subStart < win.Length)
+                    {
+                        int sub = Math.Min(0x10000, win.Length - subStart);
+                        WriteUncompressedChunkHeader(output, firstChunk, sub);
+                        output.Write(win, subStart, sub);
+                        firstChunk = false;
+                        subStart += sub;
+                    }
+                }
+            }
+        }
+
+        // 结束标记。
+        output.WriteByte(0x00);
+        return total;
+    }
+
+    /// <summary>
+    /// 从流中读取至多 2 MiB 的一个窗口；EOF 时返回 null。
+    /// <para>Reads one window of up to 2 MiB from the stream; returns null at EOF.</para>
+    /// </summary>
+    private static byte[]? ReadWindow(Stream input)
+    {
+        var win = new byte[UncompressedChunkMax];
+        int read = 0;
+        while (read < win.Length)
+        {
+            int n = input.Read(win, read, win.Length - read);
+            if (n <= 0)
+                break;
+            read += n;
+        }
+        if (read == 0)
+            return null;
+        if (read == win.Length)
+            return win;
+        return win.AsSpan(0, read).ToArray();
+    }
+
+    /// <summary>
     /// 用独立的 LZMA1 编码器压缩一个数据块，返回不含 5 字节属性头的裸 LZMA1 数据。
     /// <para>Compresses one data block with an independent LZMA1 encoder; returns raw LZMA1 data without the 5-byte property header.</para>
     /// </summary>

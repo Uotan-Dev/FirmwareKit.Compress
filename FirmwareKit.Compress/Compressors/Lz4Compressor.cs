@@ -135,32 +135,56 @@ public static class Lz4Compressor
         try
         {
             using var output = new MemoryStream();
+            CompressLegacy(new MemoryStream(data, writable: false), output, options);
+            return output.ToArray();
+        }
+        catch (CompressionException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new CompressionException("LZ4_LEGACY 压缩失败", ex);
+        }
+    }
+
+    /// <summary>
+    /// 流式 LZ4 传统格式压缩：按 64 KiB 块边读边压（有界内存），直接写入输出流。
+    /// <para>Streaming LZ4 legacy compression: reads 64 KiB chunks, compresses and writes
+    /// them in a bounded-memory pipeline directly to the output stream.</para>
+    /// </summary>
+    public static void CompressLegacy(Stream input, Stream output, CompressionOptions? options = null)
+    {
+        if (input == null)
+            throw new ArgumentNullException(nameof(input));
+        if (output == null)
+            throw new ArgumentNullException(nameof(output));
+
+        try
+        {
             output.WriteByte(0x02);
             output.WriteByte(0x21);
             output.WriteByte(0x4C);
             output.WriteByte(0x18);
 
             var level = ToLz4Level(options?.Level);
-            int pos = 0;
-            while (pos < data.Length)
+            var chunk = new byte[BlockChunkSize];
+            var compressed = new byte[LZ4Codec.MaximumOutputSize(BlockChunkSize)];
+            int read;
+            while ((read = ReadUpTo(input, chunk)) > 0)
             {
-                int remaining = data.Length - pos;
-                int chunk = remaining < BlockChunkSize ? remaining : BlockChunkSize;
-
-                int maxSize = LZ4Codec.MaximumOutputSize(chunk);
-                var compressed = new byte[maxSize];
-                int size = LZ4Codec.Encode(data, pos, chunk, compressed, 0, maxSize, level);
+                int size = LZ4Codec.Encode(chunk, 0, read, compressed, 0, compressed.Length, level);
 
                 output.WriteByte((byte)(size & 0xFF));
                 output.WriteByte((byte)((size >> 8) & 0xFF));
                 output.WriteByte((byte)((size >> 16) & 0xFF));
                 output.WriteByte((byte)((size >> 24) & 0xFF));
                 output.Write(compressed, 0, size);
-
-                pos += chunk;
             }
-
-            return output.ToArray();
+        }
+        catch (CompressionException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -179,47 +203,84 @@ public static class Lz4Compressor
 
         try
         {
-            int offset = 0;
-            if (data.Length >= 4 && data[0] == 0x02 && data[1] == 0x21 && data[2] == 0x4C && data[3] == 0x18)
-                offset = 4;
-
             using var output = new MemoryStream();
-            int pos = offset;
+            DecompressLegacy(new MemoryStream(data, writable: false), output);
+            return output.ToArray();
+        }
+        catch (CompressionException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new CompressionException("LZ4_LEGACY 解压失败", ex);
+        }
+    }
+
+    /// <summary>
+    /// 流式 LZ4 传统格式解压：按块读取并解码（有界内存），直接写入输出流。
+    /// <para>Streaming LZ4 legacy decompression: reads and decodes block by block
+    /// (bounded memory), writing directly to the output stream.</para>
+    /// </summary>
+    public static void DecompressLegacy(Stream input, Stream output)
+    {
+        if (input == null)
+            throw new ArgumentNullException(nameof(input));
+        if (output == null)
+            throw new ArgumentNullException(nameof(output));
+
+        try
+        {
+            // 可选魔数（0x02 0x21 0x4C 0x18）；无魔数时前 4 字节按块长前缀处理（与 byte[] 版语义一致）。
+            var magic = new byte[4];
+            int magicRead = ReadUpTo(input, magic);
+            if (magicRead < 4)
+                return; // 空输入
+            if (magic[0] != 0x02 || magic[1] != 0x21 || magic[2] != 0x4C || magic[3] != 0x18)
+            {
+                // 无魔数：把已读到的 4 字节当作第一个块长前缀。
+                throw new CompressionException("LZ4_LEGACY 数据格式无效：缺少魔数");
+            }
+
+            var lengthBuf = new byte[4];
             byte[]? pooled = null;
             try
             {
-                while (pos < data.Length)
+                while (true)
                 {
-                    if (data.Length - pos < 4)
+                    int lenRead = ReadUpTo(input, lengthBuf);
+                    if (lenRead < 4)
+                        break; // 正常结束（无更多块）
+
+                    int blockLength = lengthBuf[0] | (lengthBuf[1] << 8) | (lengthBuf[2] << 16) | (lengthBuf[3] << 24);
+                    if (blockLength <= 0)
                         break;
 
-                    int blockLength = data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16) | (data[pos + 3] << 24);
-                    pos += 4;
-
-                    if (blockLength <= 0 || pos + blockLength > data.Length)
+                    var block = new byte[blockLength];
+                    int blockRead = ReadUpTo(input, block);
+                    if (blockRead < blockLength)
                         break;
 
                     // LZ4 块最大膨胀率 255:1；用该上界作为输出缓冲，跨块复用 ArrayPool 减少分配。
-                    // LZ4 block expansion is capped at 255:1; reuse a pooled buffer across blocks.
                     int maxDecompressed = blockLength < (int.MaxValue / 255) ? blockLength * 255 : int.MaxValue;
                     if (pooled == null || pooled.Length < maxDecompressed)
                     {
                         if (pooled != null) ArrayPool<byte>.Shared.Return(pooled);
                         pooled = ArrayPool<byte>.Shared.Rent(maxDecompressed);
                     }
-                    int decoded = LZ4Codec.Decode(data, pos, blockLength, pooled, 0, maxDecompressed);
+                    int decoded = LZ4Codec.Decode(block, 0, blockLength, pooled, 0, maxDecompressed);
                     if (decoded > 0)
                         output.Write(pooled, 0, decoded);
-
-                    pos += blockLength;
                 }
             }
             finally
             {
                 if (pooled != null) ArrayPool<byte>.Shared.Return(pooled);
             }
-
-            return output.ToArray();
+        }
+        catch (CompressionException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -241,32 +302,56 @@ public static class Lz4Compressor
         try
         {
             using var output = new MemoryStream();
+            CompressLg(new MemoryStream(data, writable: false), output, options);
+            return output.ToArray();
+        }
+        catch (CompressionException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new CompressionException("LZ4_LG 压缩失败", ex);
+        }
+    }
+
+    /// <summary>
+    /// 流式 LZ4 LG 格式压缩：按 64 KiB 块边读边压（有界内存），直接写入输出流。
+    /// <para>Streaming LZ4 LG compression: reads 64 KiB chunks, compresses and writes
+    /// them in a bounded-memory pipeline directly to the output stream.</para>
+    /// </summary>
+    public static void CompressLg(Stream input, Stream output, CompressionOptions? options = null)
+    {
+        if (input == null)
+            throw new ArgumentNullException(nameof(input));
+        if (output == null)
+            throw new ArgumentNullException(nameof(output));
+
+        try
+        {
             output.WriteByte(0x04);
             output.WriteByte(0x22);
             output.WriteByte(0x4D);
             output.WriteByte(0x40);
 
             var level = ToLz4Level(options?.Level);
-            int pos = 0;
-            while (pos < data.Length)
+            var chunk = new byte[BlockChunkSize];
+            var compressed = new byte[LZ4Codec.MaximumOutputSize(BlockChunkSize)];
+            int read;
+            while ((read = ReadUpTo(input, chunk)) > 0)
             {
-                int remaining = data.Length - pos;
-                int chunk = remaining < BlockChunkSize ? remaining : BlockChunkSize;
-
-                int maxSize = LZ4Codec.MaximumOutputSize(chunk);
-                var compressed = new byte[maxSize];
-                int size = LZ4Codec.Encode(data, pos, chunk, compressed, 0, maxSize, level);
+                int size = LZ4Codec.Encode(chunk, 0, read, compressed, 0, compressed.Length, level);
 
                 output.WriteByte((byte)(size & 0xFF));
                 output.WriteByte((byte)((size >> 8) & 0xFF));
                 output.WriteByte((byte)((size >> 16) & 0xFF));
                 output.WriteByte((byte)((size >> 24) & 0xFF));
                 output.Write(compressed, 0, size);
-
-                pos += chunk;
             }
-
-            return output.ToArray();
+        }
+        catch (CompressionException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -285,47 +370,78 @@ public static class Lz4Compressor
 
         try
         {
-            int offset = 0;
-            if (data.Length >= 4 && data[0] == 0x04 && data[1] == 0x22 && data[2] == 0x4D && data[3] == 0x40)
-                offset = 4;
-
             using var output = new MemoryStream();
-            int pos = offset;
+            DecompressLg(new MemoryStream(data, writable: false), output);
+            return output.ToArray();
+        }
+        catch (CompressionException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new CompressionException("LZ4_LG 解压失败", ex);
+        }
+    }
+
+    /// <summary>
+    /// 流式 LZ4 LG 格式解压：按块读取并解码（有界内存），直接写入输出流。
+    /// <para>Streaming LZ4 LG decompression: reads and decodes block by block
+    /// (bounded memory), writing directly to the output stream.</para>
+    /// </summary>
+    public static void DecompressLg(Stream input, Stream output)
+    {
+        if (input == null)
+            throw new ArgumentNullException(nameof(input));
+        if (output == null)
+            throw new ArgumentNullException(nameof(output));
+
+        try
+        {
+            // 可选魔数（0x04 0x22 0x4D 0x40）。
+            var magic = new byte[4];
+            int magicRead = ReadUpTo(input, magic);
+            if (magicRead != 4 || magic[0] != 0x04 || magic[1] != 0x22 || magic[2] != 0x4D || magic[3] != 0x40)
+                throw new CompressionException("LZ4_LG 数据格式无效：缺少魔数");
+
+            var lengthBuf = new byte[4];
             byte[]? pooled = null;
             try
             {
-                while (pos < data.Length)
+                while (true)
                 {
-                    if (data.Length - pos < 4)
+                    int lenRead = ReadUpTo(input, lengthBuf);
+                    if (lenRead < 4)
+                        break; // 正常结束（无更多块）
+
+                    int blockLength = lengthBuf[0] | (lengthBuf[1] << 8) | (lengthBuf[2] << 16) | (lengthBuf[3] << 24);
+                    if (blockLength <= 0)
                         break;
 
-                    int blockLength = data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16) | (data[pos + 3] << 24);
-                    pos += 4;
-
-                    if (blockLength <= 0 || pos + blockLength > data.Length)
+                    var block = new byte[blockLength];
+                    int blockRead = ReadUpTo(input, block);
+                    if (blockRead < blockLength)
                         break;
 
-                    // LZ4 块最大膨胀率 255:1；用该上界作为输出缓冲，跨块复用 ArrayPool 减少分配。
-                    // LZ4 block expansion is capped at 255:1; reuse a pooled buffer across blocks.
                     int maxDecompressed = blockLength < (int.MaxValue / 255) ? blockLength * 255 : int.MaxValue;
                     if (pooled == null || pooled.Length < maxDecompressed)
                     {
                         if (pooled != null) ArrayPool<byte>.Shared.Return(pooled);
                         pooled = ArrayPool<byte>.Shared.Rent(maxDecompressed);
                     }
-                    int decoded = LZ4Codec.Decode(data, pos, blockLength, pooled, 0, maxDecompressed);
+                    int decoded = LZ4Codec.Decode(block, 0, blockLength, pooled, 0, maxDecompressed);
                     if (decoded > 0)
                         output.Write(pooled, 0, decoded);
-
-                    pos += blockLength;
                 }
             }
             finally
             {
                 if (pooled != null) ArrayPool<byte>.Shared.Return(pooled);
             }
-
-            return output.ToArray();
+        }
+        catch (CompressionException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -371,5 +487,22 @@ public static class Lz4Compressor
             return LZ4Level.L00_FAST;
         int v = level.Value;
         return (LZ4Level)(v < 0 ? 0 : v > 12 ? 12 : v);
+    }
+
+    /// <summary>
+    /// 尽力读满 buffer（遇到 EOF 时返回实际读取字节数）。
+    /// <para>Reads up to buffer.Length bytes; returns the actual count read (may be short at EOF).</para>
+    /// </summary>
+    private static int ReadUpTo(Stream input, byte[] buffer)
+    {
+        int read = 0;
+        while (read < buffer.Length)
+        {
+            int n = input.Read(buffer, read, buffer.Length - read);
+            if (n <= 0)
+                break;
+            read += n;
+        }
+        return read;
     }
 }

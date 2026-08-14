@@ -14,6 +14,12 @@
   - brotli（.NET 解码器不支持串联流）与 lz4（K4os 解码器对 ≥512 KB 串联帧不可靠）暂不并行。
 - 解码端支持多成员流（仍单线程）：bzip2 改用 `decompressConcatenated=true`；
   zlib/deflate 改用 SharpCompress 解码器并按 `TotalIn` 逐成员解压。
+- 块格式 Stream 级压缩/解压流式化，降低大文件内存开销（不再整块缓冲输入）：
+  - xz：固定 2 MiB 窗口流水线压缩（支持并行，输出与 byte[] 路径逐字节一致）；
+  - lzma：LZMA SDK 流式 `Code`（不可定位输入写未知大小 + EndMarker）；
+  - zstd：ZstdSharp `CompressionStream`/`DecompressionStream` 直通；
+  - lz4_legacy / lz4_lg / lzop：按块边读边压/边解（有界内存）；
+  - zopfli 因全局优化仍需整块输入，保持缓冲。
 
 ## [1.0.0] - 2026-08-13
 

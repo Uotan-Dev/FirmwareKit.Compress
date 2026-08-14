@@ -33,8 +33,25 @@ internal static class XzContainer
     /// <param name="checkType">校验类型（0x01=CRC32，0x04=CRC64）。<para>Check type (0x01=CRC32, 0x04=CRC64).</para></param>
     public static byte[] Wrap(byte[] lzma2Data, byte[] originalData, uint dictionarySize, byte checkType = CheckTypeCrc32)
     {
-        using var output = new MemoryStream();
+        byte[] check = checkType == CheckTypeCrc64
+            ? WriteUInt64LE(Crc64.Compute(originalData))
+            : WriteUInt32LE(Crc32.Compute(originalData));
 
+        using var output = new MemoryStream();
+        WriteContainer(output, lzma2Data, (ulong)originalData.Length, check, dictionarySize, checkType);
+        return output.ToArray();
+    }
+
+    /// <summary>
+    /// 将 LZMA2 原始流封装为完整 .xz 文件并直接写入流（供流式压缩使用：
+    /// 校验与未压缩大小由调用方预先计算，无需整块缓冲原始数据）。
+    /// <para>Wraps a raw LZMA2 stream into a complete .xz file and writes it directly to
+    /// the stream (used by streaming compression: the check and uncompressed size are
+    /// precomputed by the caller, so the original data never needs full buffering).</para>
+    /// </summary>
+    public static void WriteContainer(Stream output, byte[] lzma2Data, ulong uncompressedSize,
+        byte[] check, uint dictionarySize, byte checkType = CheckTypeCrc32)
+    {
         // Stream header / 流头
         output.Write(HeaderMagic, 0, HeaderMagic.Length);
         byte[] streamFlags = { 0x00, checkType };
@@ -43,7 +60,7 @@ internal static class XzContainer
 
         // Block header / 块头
         byte dictIndex = DictionarySizeToIndex(dictionarySize);
-        byte[] blockHeader = BuildBlockHeader(lzma2Data.Length, originalData.Length, dictIndex);
+        byte[] blockHeader = BuildBlockHeader(lzma2Data.Length, uncompressedSize, dictIndex);
 
         // 块总大小（块头 + 压缩数据 + 块填充 + 校验）必须是 4 的倍数。
         int blockPadding = (4 - ((blockHeader.Length + lzma2Data.Length) % 4)) % 4;
@@ -53,22 +70,14 @@ internal static class XzContainer
         for (int i = 0; i < blockPadding; i++)
             output.WriteByte(0);
 
-        // Check / 校验
-        if (checkType == CheckTypeCrc64)
-        {
-            ulong crc = Crc64.Compute(originalData);
-            WriteUInt64LE(output, crc);
-        }
-        else
-        {
-            WriteCrc32(output, originalData);
-        }
+        // Check / 校验（调用方预计算，长度 4 或 8）。
+        output.Write(check, 0, check.Length);
 
         // 未填充块大小 = 块头 + 压缩数据 + 校验（不含块填充）。
-        ulong unpaddedSize = (ulong)(blockHeader.Length + lzma2Data.Length + (checkType == CheckTypeCrc64 ? 8 : 4));
+        ulong unpaddedSize = (ulong)(blockHeader.Length + lzma2Data.Length + check.Length);
 
         // Index / 索引
-        byte[] index = BuildIndex(unpaddedSize, (ulong)originalData.Length);
+        byte[] index = BuildIndex(unpaddedSize, uncompressedSize);
 
         // Stream footer / 流尾
         output.Write(index, 0, index.Length);
@@ -87,15 +96,13 @@ internal static class XzContainer
         WriteCrc32(output, footerPrefix);
         output.Write(footerPrefix, 0, footerPrefix.Length);
         output.Write(FooterMagic, 0, FooterMagic.Length);
-
-        return output.ToArray();
     }
 
     /// <summary>
     /// 构建块头：块头大小字节 + 块标志 + 压缩/未压缩大小 + 过滤器 + 填充 + CRC32。
     /// <para>Builds the block header: size byte + flags + sizes + filter + padding + CRC32.</para>
     /// </summary>
-    private static byte[] BuildBlockHeader(int compressedSize, int uncompressedSize, byte dictIndex)
+    private static byte[] BuildBlockHeader(long compressedSize, ulong uncompressedSize, byte dictIndex)
     {
         using var body = new MemoryStream();
 
@@ -103,7 +110,7 @@ internal static class XzContainer
         body.WriteByte(0xC0);
 
         WriteVli(body, (ulong)compressedSize);
-        WriteVli(body, (ulong)uncompressedSize);
+        WriteVli(body, uncompressedSize);
 
         // 过滤器 0：LZMA2，属性大小 1，属性字节 = 字典大小索引。
         WriteVli(body, FilterIdLzma2);
@@ -189,6 +196,24 @@ internal static class XzContainer
     {
         for (int i = 0; i < 8; i++)
             stream.WriteByte((byte)((value >> (8 * i)) & 0xFF));
+    }
+
+    /// <summary>返回小端序 8 字节值。<para>Returns an 8-byte little-endian value.</para></summary>
+    private static byte[] WriteUInt64LE(ulong value)
+    {
+        var buf = new byte[8];
+        for (int i = 0; i < 8; i++)
+            buf[i] = (byte)((value >> (8 * i)) & 0xFF);
+        return buf;
+    }
+
+    /// <summary>返回小端序 4 字节值。<para>Returns a 4-byte little-endian value.</para></summary>
+    private static byte[] WriteUInt32LE(uint value)
+    {
+        var buf = new byte[4];
+        for (int i = 0; i < 4; i++)
+            buf[i] = (byte)((value >> (8 * i)) & 0xFF);
+        return buf;
     }
 
     /// <summary>

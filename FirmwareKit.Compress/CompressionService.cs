@@ -90,6 +90,34 @@ public static class CompressionService
             return;
         }
 
+        // 支持流式的块格式：直接管道，避免整块缓冲（降低大输入内存开销）。
+        // Block formats with streaming support: pipe directly, avoiding full buffering.
+        switch (format)
+        {
+            case CompressionFormat.Xz:
+                XzCompressor.Compress(input, output,
+                    options?.DictionarySize ?? Lzma2Encoder.DefaultDictionarySize,
+                    maxDegreeOfParallelism: options?.MaxDegreeOfParallelism);
+                return;
+            case CompressionFormat.Lzma:
+                LzmaCompressor.Compress(input, output, options);
+                return;
+            case CompressionFormat.Zstd:
+                ZstdCompressor.Compress(input, output, options);
+                return;
+            case CompressionFormat.Lz4Legacy:
+                Lz4Compressor.CompressLegacy(input, output, options);
+                return;
+            case CompressionFormat.Lz4Lg:
+                Lz4Compressor.CompressLg(input, output, options);
+                return;
+            case CompressionFormat.Lzop:
+                LzopCompressor.Compress(input, output, options);
+                return;
+        }
+
+        // zopfli 需要整块输入（算法全局优化）：保持缓冲。
+        // zopfli requires the whole input (global optimization): stays buffered.
         using var buffer = new MemoryStream();
         input.CopyTo(buffer);
         var result = CompressCore(buffer.ToArray(), format, options);
@@ -123,16 +151,28 @@ public static class CompressionService
             return;
         }
 
-        // xz/lzma 的解码器本身是流式的：大输入直接管道，避免整块缓冲。
-        if (format == CompressionFormat.Xz)
+        // 底层解码器支持流式的块格式：直接管道，避免整块缓冲。
+        // Block formats whose decoders are inherently streaming: pipe directly.
+        switch (format)
         {
-            XzCompressor.Decompress(input, output);
-            return;
-        }
-        if (format == CompressionFormat.Lzma)
-        {
-            LzmaCompressor.Decompress(input, output);
-            return;
+            case CompressionFormat.Xz:
+                XzCompressor.Decompress(input, output);
+                return;
+            case CompressionFormat.Lzma:
+                LzmaCompressor.Decompress(input, output);
+                return;
+            case CompressionFormat.Zstd:
+                ZstdCompressor.Decompress(input, output);
+                return;
+            case CompressionFormat.Lz4Legacy:
+                Lz4Compressor.DecompressLegacy(input, output);
+                return;
+            case CompressionFormat.Lz4Lg:
+                Lz4Compressor.DecompressLg(input, output);
+                return;
+            case CompressionFormat.Lzop:
+                LzopCompressor.Decompress(input, output);
+                return;
         }
 
         var info = CompressionFormats.GetInfo(format)!;

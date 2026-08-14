@@ -30,4 +30,18 @@ internal static class Crc64
             crc = Table[(crc ^ b) & 0xFF] ^ (crc >> 8);
         return crc ^ 0xFFFFFFFFFFFFFFFFUL;
     }
+
+    /// <summary>
+    /// 增量 CRC-64：<paramref name="state"/> 为前一段的中间值（首段用 0xFFFFFFFFFFFFFFFF），
+    /// 返回更新后的中间值；全部追加后异或 0xFFFFFFFFFFFFFFFF 即得最终值。
+    /// <para>Incremental CRC-64: <paramref name="state"/> is the intermediate value of the
+    /// previous segment (start with 0xFFFFFFFFFFFFFFFF); returns the updated state; XOR
+    /// with 0xFFFFFFFFFFFFFFFF after all segments for the final value.</para>
+    /// </summary>
+    public static ulong Append(ulong state, ReadOnlySpan<byte> data)
+    {
+        foreach (byte b in data)
+            state = Table[(state ^ b) & 0xFF] ^ (state >> 8);
+        return state;
+    }
 }

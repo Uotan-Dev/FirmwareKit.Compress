@@ -35,6 +35,9 @@ public static class XzCompressor
     /// <returns>完整的 .xz 数据。<para>Complete .xz data.</para></returns>
     public static byte[] Compress(byte[] data, uint dictionarySize = Lzma2Encoder.DefaultDictionarySize, byte checkType = XzContainer.CheckTypeCrc32, int? maxDegreeOfParallelism = null)
     {
+        if (data == null)
+            throw new ArgumentNullException(nameof(data));
+
         try
         {
             if (data.Length == 0)
@@ -44,6 +47,67 @@ public static class XzCompressor
 
             byte[] lzma2 = Lzma2Encoder.Encode(data, dictionarySize, maxDegreeOfParallelism);
             return XzContainer.Wrap(lzma2, data, dictionarySize, checkType);
+        }
+        catch (Exception ex)
+        {
+            throw new CompressionException("XZ 压缩失败", ex);
+        }
+    }
+
+    /// <summary>
+    /// 流式 XZ 压缩：从输入流按 2 MiB 窗口边读边压（有界内存），直接写入输出流。
+    /// 输出与 <see cref="Compress(byte[], uint, byte, int?)"/> 对相同数据逐字节一致。
+    /// <para>Streaming XZ compression: reads the input in bounded 2 MiB windows and writes
+    /// the result directly to the output stream. Output is byte-identical to
+    /// <see cref="Compress(byte[], uint, byte, int?)"/> for the same data.</para>
+    /// </summary>
+    public static void Compress(Stream input, Stream output, uint dictionarySize = Lzma2Encoder.DefaultDictionarySize,
+        byte checkType = XzContainer.CheckTypeCrc32, int? maxDegreeOfParallelism = null)
+    {
+        if (input == null)
+            throw new ArgumentNullException(nameof(input));
+        if (output == null)
+            throw new ArgumentNullException(nameof(output));
+
+        try
+        {
+            using var lzma2 = new MemoryStream();
+
+            // 增量校验：CRC32 或 CRC64。
+            // Incremental checksum: CRC32 or CRC64.
+            ulong crc64State = 0xFFFFFFFFFFFFFFFFUL;
+            var crc32 = new System.IO.Hashing.Crc32();
+
+            long total = Lzma2Encoder.Encode(input, lzma2, dictionarySize, maxDegreeOfParallelism,
+                (win, offset, count) =>
+                {
+                    if (checkType == XzContainer.CheckTypeCrc64)
+                    {
+                        crc64State = Internal.Xz.Crc64.Append(crc64State, new ReadOnlySpan<byte>(win, offset, count));
+                    }
+                    else
+                    {
+                        crc32.Append(new ReadOnlySpan<byte>(win, offset, count));
+                    }
+                });
+
+            byte[] check;
+            if (checkType == XzContainer.CheckTypeCrc64)
+            {
+                ulong crc = crc64State ^ 0xFFFFFFFFFFFFFFFFUL;
+                check = new byte[8];
+                for (int i = 0; i < 8; i++)
+                    check[i] = (byte)((crc >> (8 * i)) & 0xFF);
+            }
+            else
+            {
+                uint crc = crc32.GetCurrentHashAsUInt32();
+                check = new byte[4];
+                for (int i = 0; i < 4; i++)
+                    check[i] = (byte)((crc >> (8 * i)) & 0xFF);
+            }
+
+            XzContainer.WriteContainer(output, lzma2.ToArray(), (ulong)total, check, dictionarySize, checkType);
         }
         catch (Exception ex)
         {
