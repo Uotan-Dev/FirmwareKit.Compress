@@ -78,6 +78,43 @@ public static class ZopfliCompressor
         if (data == null)
             throw new ArgumentNullException(nameof(data));
 
+        try
+        {
+            using var input = new MemoryStream(data);
+            using var output = new MemoryStream();
+            Compress(input, output, format, options);
+            return output.ToArray();
+        }
+        catch (CompressionException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new CompressionException("Zopfli 压缩失败", ex);
+        }
+    }
+
+    /// <summary>
+    /// 流式 Zopfli 压缩：底层算法按 1 MB master block 读取输入流（有界内存），
+    /// 直接写入输出流。注意 Zopfli 需要可定位输入（读取 Length 并顺序消费）；
+    /// 不可定位输入请先缓冲为可定位流。
+    /// <para>Streaming Zopfli compression: the underlying algorithm reads the input stream
+    /// in 1 MB master blocks (bounded memory) and writes directly to the output stream.
+    /// Zopfli requires a seekable input (reads Length and consumes it sequentially);
+    /// buffer non-seekable inputs into a seekable stream first.</para>
+    /// </summary>
+    /// <param name="input">待压缩的输入流（须可定位）。<para>The input stream to compress (must be seekable).</para></param>
+    /// <param name="output">写入压缩结果的输出流。<para>The output stream receiving the compressed data.</para></param>
+    /// <param name="format">输出格式：gzip / zlib / deflate。<para>Output format: gzip / zlib / deflate.</para></param>
+    /// <param name="options">压缩选项；为 null 时使用默认值。<para>Compression options; defaults used when null.</para></param>
+    public static void Compress(Stream input, Stream output, ZopfliFormat format, ZopfliOptions? options = null)
+    {
+        if (input == null)
+            throw new ArgumentNullException(nameof(input));
+        if (output == null)
+            throw new ArgumentNullException(nameof(output));
+
         options ??= new ZopfliOptions();
 
         try
@@ -91,10 +128,7 @@ public static class ZopfliCompressor
             Globals.verbose_more = 0;
             Globals.maxdop = options.MaxDegreeOfParallelism;
 
-            using var input = new MemoryStream(data);
-            using var output = new MemoryStream();
             Internal.Zopfli.Compress.ZopfliCompress(input, output);
-            return output.ToArray();
         }
         catch (CompressionException)
         {

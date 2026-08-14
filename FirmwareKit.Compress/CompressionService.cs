@@ -116,12 +116,14 @@ public static class CompressionService
                 return;
         }
 
-        // zopfli 需要整块输入（算法全局优化）：保持缓冲。
-        // zopfli requires the whole input (global optimization): stays buffered.
+        // zopfli 需要整块输入（算法全局优化）：缓冲到可定位流后直接交给流式入口，
+        // 避免 buffer.ToArray() 与内部输出 ToArray 的双拷贝。
+        // zopfli requires the whole input (global optimization): buffer into a seekable
+        // stream then hand it to the streaming entry point, avoiding the double ToArray.
         using var buffer = new MemoryStream();
         input.CopyTo(buffer);
-        var result = CompressCore(buffer.ToArray(), format, options);
-        output.Write(result, 0, result.Length);
+        buffer.Position = 0;
+        ZopfliCompressor.Compress(buffer, output, FirmwareKit.Compress.Internal.Zopfli.ZopfliFormat.ZOPFLI_FORMAT_GZIP, EffectiveZopfliOptions(options));
     }
 
     /// <summary>

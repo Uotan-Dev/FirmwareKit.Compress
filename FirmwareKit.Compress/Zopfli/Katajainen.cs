@@ -180,7 +180,7 @@
 
         [ThreadStatic] static Node[]? _leaves;
 
-        static Span<Node> InitializeLeaves(int length)
+        static Node[] InitializeLeaves(int length)
         {
             if (_leaves is null || _leaves.Length < length)
             {
@@ -201,7 +201,7 @@
                 _leaves = temp_nodes;
 
             }
-            return new Span<Node>(_leaves!, 0, length);
+            return _leaves!;
         }
 
         public static int ZopfliLengthLimitedCodeLengths(
@@ -231,7 +231,7 @@
                 }
             }
 
-            Node[] leaves = InitializeLeaves(numsymbols).ToArray();
+            Node[] leaves = InitializeLeaves(numsymbols);
             int SymbolNumber = 0;
 
             /* Count used symbols and place them in the leaves. */
@@ -281,7 +281,9 @@
                 }
                 leaves[i].weight = (leaves[i].weight << 9) | (uint)leaves[i].count;
             }
-            Array.Sort(leaves, delegate (Node x, Node y) { return x.weight.CompareTo(y.weight); });
+            /* 复用缓冲可能长于 numsymbols：只排序有效前缀，避免残留数据混入。 */
+            Array.Sort(leaves, 0, numsymbols,
+                Comparer<Node>.Create((x, y) => x.weight.CompareTo(y.weight)));
             for (i = 0; i < numsymbols; i++)
             {
                 leaves[i].weight >>= 9;

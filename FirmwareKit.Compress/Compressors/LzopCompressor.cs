@@ -1,3 +1,7 @@
+using FirmwareKit.Compress.Internal;
+using System.Buffers;
+using System.Threading.Tasks;
+
 namespace FirmwareKit.Compress.Compressors;
 
 /// <summary>
@@ -135,8 +139,17 @@ public static class LzopCompressor
             // Parse header.
             offset = ParseHeader(data, offset, out bool useCrc32, out bool hasUncompressedChecksum, out bool hasCompressedChecksum, out _);
 
-            // Skip header checksum (4 bytes).
-            offset += 4;
+            // Verify header checksum (Adler32, or CRC32 when F_H_CRC32 is set),
+            // covering all header bytes after the magic.
+            if (offset + 4 > data.Length)
+                throw new CompressionException("Invalid LZOP data: truncated header checksum");
+            uint storedHeaderChecksum = ReadUInt32BE(data, ref offset);
+            int headerLength = offset - LzopMagicSize - 4;
+            uint computedHeaderChecksum = useCrc32
+                ? Crc32Checksum(data, LzopMagicSize, headerLength)
+                : Adler32(data, LzopMagicSize, headerLength);
+            if (storedHeaderChecksum != computedHeaderChecksum)
+                throw new CompressionException("Invalid LZOP data: header checksum mismatch");
 
             using var output = new MemoryStream();
 
@@ -585,15 +598,50 @@ public static class LzopCompressor
 
             // ---- Data blocks ----
             // lzop writes blocks; for stored mode, compressed_size == uncompressed_size.
+            // 每块独立计算 Adler32 校验和（无跨块依赖），支持有界窗口并行；按块序拼接，
+            // 输出与串行逐字节一致。
             const int blockSize = 256 * 1024;
-            var chunk = new byte[blockSize];
-            int read;
-            while ((read = ReadUpTo(input, chunk)) > 0)
+            int dop = Parallelism.Resolve(options?.MaxDegreeOfParallelism, int.MaxValue);
+            var chunks = new List<byte[]>(dop);
+
+            while (true)
             {
-                WriteUInt32BE(output, (uint)read);               // uncompressed size
-                WriteUInt32BE(output, (uint)read);               // compressed size (stored)
-                WriteUInt32BE(output, Adler32(chunk, 0, read));  // uncompressed checksum
-                output.Write(chunk, 0, read);
+                // 批量读取至多 dop 个 256 KiB 块（内存有界）。
+                chunks.Clear();
+                while (chunks.Count < dop)
+                {
+                    byte[] chunk = new byte[blockSize];
+                    int read = ReadUpTo(input, chunk);
+                    if (read == 0)
+                        break; // EOF
+                    if (read < chunk.Length)
+                        Array.Resize(ref chunk, read);
+                    chunks.Add(chunk);
+                }
+                if (chunks.Count == 0)
+                    break;
+
+                // 各块校验和独立计算（线程安全）。
+                var checksums = new uint[chunks.Count];
+                if (chunks.Count > 1 && dop > 1)
+                {
+                    Parallel.For(0, chunks.Count, new ParallelOptions { MaxDegreeOfParallelism = dop }, i =>
+                        checksums[i] = Adler32(chunks[i], 0, chunks[i].Length));
+                }
+                else
+                {
+                    for (int i = 0; i < chunks.Count; i++)
+                        checksums[i] = Adler32(chunks[i], 0, chunks[i].Length);
+                }
+
+                // 按块序拼接输出（与串行一致）。
+                for (int i = 0; i < chunks.Count; i++)
+                {
+                    WriteUInt32BE(output, (uint)chunks[i].Length);      // uncompressed size
+                    WriteUInt32BE(output, (uint)chunks[i].Length);      // compressed size (stored)
+                    WriteUInt32BE(output, checksums[i]);                // uncompressed checksum
+                    output.Write(chunks[i], 0, chunks[i].Length);
+                }
             }
 
             // ---- End marker: uncompressed_size = 0 ----
@@ -631,98 +679,127 @@ public static class LzopCompressor
                 throw new CompressionException("Invalid LZOP data: wrong magic");
 
             // ---- Header (field by field) ----
-            int version = ReadUInt16BE(input);
+            // 用记录流收集头字段字节，用于校验和验证（校验和覆盖魔数之后的所有头字节）。
+            using var recording = new RecordingStream(input);
+            int version = ReadUInt16BE(recording);
             if (version < 0x0900)
                 throw new CompressionException($"Invalid LZOP header: unsupported version {version:X4}");
 
-            ReadUInt16BE(input); // lib_version
+            ReadUInt16BE(recording); // lib_version
             if (version >= 0x0940)
-                ReadUInt16BE(input); // version_needed
+                ReadUInt16BE(recording); // version_needed
 
-            byte method = (byte)ReadByte(input); // method
+            byte method = (byte)ReadByte(recording); // method
             if (version >= 0x0940)
-                ReadByte(input); // level
+                ReadByte(recording); // level
 
-            uint flags = ReadUInt32BE(input);
+            uint flags = ReadUInt32BE(recording);
             bool useCrc32 = (flags & F_H_CRC32) != 0;
             bool hasUncompressedChecksum = (flags & (F_ADLER32_U | F_CRC32_U)) != 0;
             bool hasCompressedChecksum = (flags & (F_ADLER32_C | F_CRC32_C)) != 0;
 
             if ((flags & F_H_FILTER) != 0)
-                ReadUInt32BE(input); // filter
+                ReadUInt32BE(recording); // filter
 
-            ReadUInt32BE(input); // mode
-            ReadUInt32BE(input); // mtime_low
+            ReadUInt32BE(recording); // mode
+            ReadUInt32BE(recording); // mtime_low
             if (version >= 0x0940)
-                ReadUInt32BE(input); // mtime_high
+                ReadUInt32BE(recording); // mtime_high
 
-            int nameLen = ReadByte(input);
+            int nameLen = ReadByte(recording);
             for (int i = 0; i < nameLen; i++)
-                ReadByte(input); // name
+                ReadByte(recording); // name
 
-            ReadUInt32BE(input); // header checksum (not verified here)
+            // Verify header checksum (Adler32, or CRC32 when F_H_CRC32 is set).
+            // 记录流中最后的 4 字节即存储的校验和；校验覆盖其之前的全部头字节。
+            uint storedHeaderChecksum = ReadUInt32BE(recording);
+            byte[] headerBytes = recording.ToArray();
+            int headerLength = headerBytes.Length - 4;
+            uint computedHeaderChecksum = useCrc32
+                ? Crc32Checksum(headerBytes, 0, headerLength)
+                : Adler32(headerBytes, 0, headerLength);
+            if (storedHeaderChecksum != computedHeaderChecksum)
+                throw new CompressionException("Invalid LZOP data: header checksum mismatch");
 
             // ---- Data blocks ----
+            // 块数据与输出缓冲跨块复用 ArrayPool，减少逐块分配。
             byte[]? compressed = null;
-            while (true)
+            byte[]? blockOut = null;
+            try
             {
-                uint uncompressedSize = ReadUInt32BE(input);
-                if (uncompressedSize == 0)
-                    break; // end marker
-
-                uint compressedSize = ReadUInt32BE(input);
-
-                uint uncompressedChecksum = 0;
-                if (hasUncompressedChecksum)
-                    uncompressedChecksum = ReadUInt32BE(input);
-                if (hasCompressedChecksum)
-                    ReadUInt32BE(input);
-
-                if (compressedSize > uncompressedSize && compressedSize > 0)
-                    throw new CompressionException("Invalid LZOP data: compressed block larger than uncompressed");
-
-                if (compressed == null || compressed.Length < (int)compressedSize)
-                    compressed = new byte[compressedSize];
-
-                // 精确读取 compressedSize 字节：不能复用 ReadUpTo（复用大数组时
-                // 会读满数组长度而吞掉后续块/结束标记）。
-                int dataRead = ReadExactly(input, compressed, (int)compressedSize);
-                if (dataRead < (int)compressedSize)
-                    throw new CompressionException("Invalid LZOP data: truncated block data");
-
-                byte[] blockOut = new byte[uncompressedSize];
-
-                if (compressedSize == uncompressedSize)
+                while (true)
                 {
-                    // Stored block.
-                    Array.Copy(compressed, 0, blockOut, 0, (int)uncompressedSize);
-                }
-                else
-                {
-                    // LZO1X compressed block.
-                    int decoded = Lzo1xDecompressSafe(compressed, 0, (int)compressedSize, blockOut, 0, (int)uncompressedSize);
-                    if (decoded != (int)uncompressedSize)
-                        throw new CompressionException($"Invalid LZOP data: block decompressed to {decoded} bytes, expected {uncompressedSize}");
-                }
+                    uint uncompressedSize = ReadUInt32BE(input);
+                    if (uncompressedSize == 0)
+                        break; // end marker
 
-                // Verify uncompressed checksum when present.
-                if (hasUncompressedChecksum)
-                {
-                    uint actualChecksum = useCrc32
-                        ? Crc32Checksum(blockOut, 0, blockOut.Length)
-                        : Adler32(blockOut, 0, blockOut.Length);
-                    if (actualChecksum != uncompressedChecksum)
+                    uint compressedSize = ReadUInt32BE(input);
+
+                    uint uncompressedChecksum = 0;
+                    if (hasUncompressedChecksum)
+                        uncompressedChecksum = ReadUInt32BE(input);
+                    if (hasCompressedChecksum)
+                        ReadUInt32BE(input);
+
+                    if (compressedSize > uncompressedSize && compressedSize > 0)
+                        throw new CompressionException("Invalid LZOP data: compressed block larger than uncompressed");
+
+                    if (compressed == null || compressed.Length < (int)compressedSize)
                     {
-                        // Some lzop files use Adler32 even when F_H_CRC32 is not set; try the other.
-                        uint otherChecksum = useCrc32
-                            ? Adler32(blockOut, 0, blockOut.Length)
-                            : Crc32Checksum(blockOut, 0, blockOut.Length);
-                        if (otherChecksum != uncompressedChecksum)
-                            throw new CompressionException("Invalid LZOP data: uncompressed checksum mismatch");
+                        if (compressed != null) ArrayPool<byte>.Shared.Return(compressed);
+                        compressed = ArrayPool<byte>.Shared.Rent((int)compressedSize);
                     }
-                }
 
-                output.Write(blockOut, 0, blockOut.Length);
+                    // 精确读取 compressedSize 字节：不能复用 ReadUpTo（复用大数组时
+                    // 会读满数组长度而吞掉后续块/结束标记）。
+                    int dataRead = ReadExactly(input, compressed, (int)compressedSize);
+                    if (dataRead < (int)compressedSize)
+                        throw new CompressionException("Invalid LZOP data: truncated block data");
+
+                    if (blockOut == null || blockOut.Length < (int)uncompressedSize)
+                    {
+                        if (blockOut != null) ArrayPool<byte>.Shared.Return(blockOut);
+                        blockOut = ArrayPool<byte>.Shared.Rent((int)uncompressedSize);
+                    }
+                    int outLen = (int)uncompressedSize;
+
+                    if (compressedSize == uncompressedSize)
+                    {
+                        // Stored block.
+                        Array.Copy(compressed, 0, blockOut, 0, outLen);
+                    }
+                    else
+                    {
+                        // LZO1X compressed block.
+                        int decoded = Lzo1xDecompressSafe(compressed, 0, (int)compressedSize, blockOut, 0, outLen);
+                        if (decoded != outLen)
+                            throw new CompressionException($"Invalid LZOP data: block decompressed to {decoded} bytes, expected {uncompressedSize}");
+                    }
+
+                    // Verify uncompressed checksum when present.
+                    if (hasUncompressedChecksum)
+                    {
+                        uint actualChecksum = useCrc32
+                            ? Crc32Checksum(blockOut, 0, outLen)
+                            : Adler32(blockOut, 0, outLen);
+                        if (actualChecksum != uncompressedChecksum)
+                        {
+                            // Some lzop files use Adler32 even when F_H_CRC32 is not set; try the other.
+                            uint otherChecksum = useCrc32
+                                ? Adler32(blockOut, 0, outLen)
+                                : Crc32Checksum(blockOut, 0, outLen);
+                            if (otherChecksum != uncompressedChecksum)
+                                throw new CompressionException("Invalid LZOP data: uncompressed checksum mismatch");
+                        }
+                    }
+
+                    output.Write(blockOut, 0, outLen);
+                }
+            }
+            finally
+            {
+                if (compressed != null) ArrayPool<byte>.Shared.Return(compressed);
+                if (blockOut != null) ArrayPool<byte>.Shared.Return(blockOut);
             }
         }
         catch (CompressionException)
@@ -791,6 +868,42 @@ public static class LzopCompressor
             read += n;
         }
         return read;
+    }
+
+    /// <summary>
+    /// 只读记录流：转发读取到内部流，同时收集已读字节（用于 LZOP 头部校验和验证）。
+    /// <para>Read-only recording stream: forwards reads to the inner stream while
+    /// collecting the bytes read (used to verify the LZOP header checksum).</para>
+    /// </summary>
+    private sealed class RecordingStream : Stream
+    {
+        private readonly Stream _inner;
+        private readonly List<byte> _recorded = new List<byte>(64);
+
+        public RecordingStream(Stream inner) => _inner = inner;
+
+        /// <summary>已读字节。<para>The bytes read so far.</para></summary>
+        public byte[] ToArray() => _recorded.ToArray();
+
+        public override bool CanRead => _inner.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            int n = _inner.Read(buffer, offset, count);
+            if (n > 0)
+            {
+                for (int i = 0; i < n; i++)
+                    _recorded.Add(buffer[offset + i]);
+            }
+            return n;
+        }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     // ---- Checksums ----

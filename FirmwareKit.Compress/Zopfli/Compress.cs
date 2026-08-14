@@ -1981,7 +1981,7 @@ namespace FirmwareKit.Compress.Internal.Zopfli
             List<ulong> lz77splitpoints = new List<ulong>();
             ulong nlz77points;
             ZopfliLZ77Store store = new ZopfliLZ77Store(InFile);
-            ZopfliHash h = new ZopfliHash();
+            ZopfliHash h = ZopfliHash.GetThreadLocal();
 
             /* Unintuitively, Using a simple LZ77 method here instead of ZopfliLZ77Optimal
             results in better blocks. */

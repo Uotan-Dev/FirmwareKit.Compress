@@ -185,14 +185,14 @@ namespace FirmwareKit.Compress.Internal.Zopfli
                              int instart, int inend,
                              SymbolStats stats,
                              ushort[] length_array,
-                             ZopfliHash h, float[] costs, bool fixedcosts)
+                             ZopfliHash h, float[] costs, bool fixedcosts,
+                             ushort[] sublen, double[] costLen, double[] costDist)
         {
             /* Best cost to get here so far. */
             ulong blocksize = (ulong)(inend - instart);
             ulong i, k, kend;
             ushort leng = 0; //bogus value
             ushort dist = 0; //bogusvalue
-            ushort[] sublen = new ushort[259];
             ulong windowstart = (ulong)(instart > ZopfliHash.ZOPFLI_WINDOW_SIZE
                 ? instart - ZopfliHash.ZOPFLI_WINDOW_SIZE : 0);
             double result;
@@ -205,8 +205,6 @@ namespace FirmwareKit.Compress.Internal.Zopfli
                For dist > 0 the cost is separable: cost(len, dist) = costLen[len] +
                costDist[dist]. This turns the inner cost loop into two array lookups
                instead of repeated symbol/extra-bit function calls per position. */
-            double[] costLen = new double[ZOPFLI_MAX_MATCH + 1];
-            double[] costDist = new double[ZopfliHash.ZOPFLI_WINDOW_SIZE + 1];
             for (int len = ZOPFLI_MIN_MATCH; len <= ZOPFLI_MAX_MATCH; len++)
             {
                 int lbits = Symbols.ZopfliGetLengthExtraBits(len);
@@ -479,9 +477,10 @@ namespace FirmwareKit.Compress.Internal.Zopfli
         static double LZ77OptimalRun(ZopfliBlockState s,
             byte[] InFile, int instart, int inend, List<ushort> path,
             ushort[] length_array, SymbolStats stats, ZopfliLZ77Store store,
-            ZopfliHash h, float[] costs, bool fixedcosts)
+            ZopfliHash h, float[] costs, bool fixedcosts,
+            ushort[] sublen, double[] costLen, double[] costDist)
         {
-            double cost = GetBestLengths(s, InFile, instart, inend, stats, length_array, h, costs, fixedcosts);
+            double cost = GetBestLengths(s, InFile, instart, inend, stats, length_array, h, costs, fixedcosts, sublen, costLen, costDist);
             ulong pathsize = 0;
             path.Clear();
             TraceBackwards((ulong)(inend - instart), length_array, path, ref pathsize);
@@ -500,7 +499,7 @@ namespace FirmwareKit.Compress.Internal.Zopfli
             ushort[] length_array = new ushort[blocksize + 1];
             List<ushort> path = new List<ushort>();
             ZopfliLZ77Store currentstore = new ZopfliLZ77Store(InFile);
-            ZopfliHash h = new ZopfliHash();
+            ZopfliHash h = ZopfliHash.GetThreadLocal();
             SymbolStats stats = new SymbolStats();
             SymbolStats beststats = new SymbolStats();
             SymbolStats laststats = new SymbolStats();
@@ -512,6 +511,11 @@ namespace FirmwareKit.Compress.Internal.Zopfli
             /* Try randomizing the costs a bit once the size stabilizes. */
             RanState ran_state = new RanState();
             int lastrandomstep = -1;
+
+            /* 热循环缓冲：每次迭代复用，避免每轮分配（GetBestLengths 内不再自建）。 */
+            ushort[] sublen = new ushort[259];
+            double[] costLen = new double[ZOPFLI_MAX_MATCH + 1];
+            double[] costDist = new double[ZopfliHash.ZOPFLI_WINDOW_SIZE + 1];
 
             /* Do regular deflate, then loop multiple shortest path runs, each time using
             the statistics of the previous run. */
@@ -526,7 +530,7 @@ namespace FirmwareKit.Compress.Internal.Zopfli
             {
                 currentstore.ResetStore(InFile);
                 LZ77OptimalRun(s, InFile, instart, inend, path, length_array, stats,
-                               currentstore, h, costs, false);
+                               currentstore, h, costs, false, sublen, costLen, costDist);
                 cost = ZopfliCalculateBlockSize(currentstore, 0, currentstore.size, 2);
                 if (Globals.verbose_more > 0 || (Globals.verbose > 0 && cost < bestcost))
                 {
@@ -572,9 +576,12 @@ namespace FirmwareKit.Compress.Internal.Zopfli
             ushort[] length_array = new ushort[blocksize + 1];
             List<ushort> path = new List<ushort>();
             path.Add(0);
-            ZopfliHash h = new ZopfliHash();
+            ZopfliHash h = ZopfliHash.GetThreadLocal();
             float[] costs = new float[blocksize + 1];
             SymbolStats stats = new SymbolStats();
+            ushort[] sublen = new ushort[259];
+            double[] costLen = new double[ZOPFLI_MAX_MATCH + 1];
+            double[] costDist = new double[ZopfliHash.ZOPFLI_WINDOW_SIZE + 1];
 
             s.blockstart = (int)instart;
             s.blockend = (int)inend;
@@ -582,7 +589,8 @@ namespace FirmwareKit.Compress.Internal.Zopfli
             /* Shortest path for fixed tree This one should give the shortest possible
             result for fixed tree, no repeated runs are needed since the tree is known. */
             LZ77OptimalRun(s, InFile, (int)instart, (int)inend, path,
-                           length_array, stats, store, h, costs, true);
+                           length_array, stats, store, h, costs, true,
+                           sublen, costLen, costDist);
 
 
         }

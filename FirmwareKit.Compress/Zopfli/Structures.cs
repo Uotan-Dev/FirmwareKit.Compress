@@ -282,6 +282,14 @@ namespace FirmwareKit.Compress.Internal.Zopfli
         public const int ZOPFLI_WINDOW_MASK = ZOPFLI_WINDOW_SIZE - 1;
         const int ZOPFLI_MIN_MATCH = 3;
 
+        /* Thread-local instance: ZopfliHash allocates several hundred KB of hash tables,
+           and every consumer (ZopfliLZ77Greedy / GetBestLengths / FollowPath) calls
+           ZopfliResetHash before use, so a per-thread instance can be safely reused
+           across blocks without re-allocating the tables. */
+        [ThreadStatic] private static ZopfliHash? _threadLocal;
+
+        public static ZopfliHash GetThreadLocal() => _threadLocal ??= new ZopfliHash();
+
         public int[] head;  /* Hash value to index of its most recent occurrence. */
         public short[] prev;  /* Index to index of prev. occurrence of same hash. */
         public short[] hashval;  /* Index to hash value at this index. */
